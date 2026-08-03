@@ -1,6 +1,6 @@
 # SavedAtlas
 
-SavedAtlas — локальный macOS‑органайзер для Telegram «Избранного». Он импортирует сообщения через пользовательский MTProto‑клиент, индексирует их в SQLite/FTS5, классифицирует через RouterAI, создаёт темы и проверяет актуальность материалов с источниками.
+SavedAtlas — локальный macOS‑органайзер для Telegram «Избранного». Он импортирует сообщения через пользовательский MTProto‑клиент, индексирует их в SQLite/FTS5, классифицирует через RouterAI и проверяет актуальность материалов с источниками. Автоматическое создание новых тем выключено по умолчанию и включается отдельно.
 
 > Это не Telegram-бот. SavedAtlas авторизуется как пользовательский MTProto-клиент и работает с вашим личным чатом «Избранное» только на чтение.
 
@@ -11,14 +11,14 @@ SavedAtlas — локальный macOS‑органайзер для Telegram �
 - macOS 13+ на Apple Silicon;
 - Node.js 20+ и npm;
 - для реального подключения: `api_id`/`api_hash` с [my.telegram.org](https://my.telegram.org) и обычный ключ RouterAI;
-- Xcode не нужен для локального запуска и unsigned DMG. Сертификат Apple Developer нужен только для подписи и нотарификации.
+- Xcode Command Line Tools нужны для native rebuild `better-sqlite3` при создании DMG. Сертификат Apple Developer нужен только для подписи и нотарификации.
 
 ## Быстрый запуск в Demo Mode
 
 ```bash
 git clone https://github.com/Leo0742/SavedAtlas.git
 cd SavedAtlas
-npm install
+npm ci
 npm run dev
 ```
 
@@ -32,7 +32,7 @@ npm run dev
 4. Если включена двухэтапная проверка, введите облачный пароль.
 5. Добавьте обычный RouterAI API key и выберите модели классификации/freshness.
 6. Проверьте подключение и выберите допустимые типы анализа.
-7. Нажмите **«Синхронизировать и разобрать новые»**.
+7. Нажмите **«Завершить и синхронизировать»**. Главное окно откроется после локального импорта; очередь анализа продолжит работу в фоне.
 
 Credentials не читаются из `.env`: они вводятся только в приложении и сразу шифруются через macOS-backed Electron `safeStorage`. После настройки удалить их можно отдельно в **Настройки → Telegram** и **Настройки → RouterAI**.
 
@@ -46,6 +46,7 @@ npm run typecheck
 npm test
 npm run build
 npm run package:mac
+npm run test:e2e:packaged
 ```
 
 | Команда | Назначение |
@@ -56,6 +57,7 @@ npm run package:mac
 | `npm test` | unit/integration тесты Vitest |
 | `npm run build` | production bundle Electron/Vite |
 | `npm run package:mac` | unsigned arm64 DMG в `release/` |
+| `npm run test:e2e:packaged` | mocked first-run и global-search E2E внутри собранного `.app` |
 
 При первом запуске откроется мастер настройки. Можно выбрать «Сразу открыть демо-режим»: в отдельную локальную базу будут добавлены 20+ примеров, и реальные ключи не потребуются. Telegram и RouterAI настраиваются в приложении: **Настройки → Telegram / RouterAI**. Значения шифруются через Electron `safeStorage` и не сохраняются в исходном коде, `.env`, SQLite или renderer state.
 
@@ -64,7 +66,7 @@ npm run package:mac
 - полноэкранный мастер настройки и MTProto‑вход с кодом/2FA;
 - полная и инкрементальная пагинация «Избранного» с checkpoint;
 - SQLite WAL, миграции, FTS5, защита ручных решений;
-- 20+ демонстрационных сообщений, темы, поиск, фильтры, детали, источники и заметки;
+- 20+ демонстрационных сообщений, темы, глобальный поиск с пагинацией, фильтры, детали, источники и заметки;
 - RouterAI classification и web freshness через `https://routerai.ru/api/v1`;
 - маскирование вероятных секретов перед AI‑запросом;
 - JSON‑экспорт без credentials/session;
@@ -106,7 +108,7 @@ Main process вызывает реальный GramJS `messages.GetHistory` дл
 
 ### 3. Классификация RouterAI
 
-RouterAI получает одно сообщение, доступные категории/темы и строгую JSON-схему. Ответ валидируется Zod. Сервис старается переиспользовать существующую тему, нормализует похожие названия и создаёт новую только при необходимости. Ошибка одного сообщения не останавливает очередь.
+RouterAI получает одно сообщение, доступные категории/темы и строгую JSON-схему. Ответ проходит Zod validation, локальный JSON repair и до двух повторных model attempts. Сервис переиспользует существующие и семантически близкие темы. Новая тема создаётся только если пользователь включил автоматическое создание, confidence выше порога и ответ не требует review. Ошибка одного сообщения не останавливает очередь.
 
 ### 4. Проверка актуальности
 
@@ -142,7 +144,8 @@ src/
   preload/          isolated typed API
   renderer/         Russian React interface
   shared/           Zod contracts and shared types
-tests/              content, database and sync tests
+tests/              unit, database, sync, queue, metadata and React tests
+e2e/                packaged Electron/Playwright test
 docs/               screenshots and design concept
 resources/          original SavedAtlas icon
 ```
@@ -154,11 +157,13 @@ resources/          original SavedAtlas icon
 - нормализацию, URL extraction, SHA-256 hash и secret redaction;
 - strict classification/freshness schemas и JSON repair;
 - SQLite migrations, FTS5 и Demo Mode;
-- Telegram pagination и incremental sync mocks;
+- full/incremental pagination на 250+ сообщениях, resume, overlap, duplicate pages и FloodWait;
 - защиту ручной темы от reanalysis;
-- cache invalidation, job recovery и экспорт без секретов.
+- cache invalidation, фактическое job recovery/drain и экспорт без секретов;
+- глобальный FTS за пределами первых 50 и reindex после classification/note/topic;
+- React first-run workflow и packaged Electron first-run/search workflow.
 
-Последняя локальная проверка: **20/20 тестов**, успешные lint, typecheck, production build и arm64 packaging.
+Локальная проверка corrective pass: **36 Vitest tests + 1 packaged Playwright E2E**, lint, typecheck, production build и unsigned arm64 packaging. Это не утверждение о GitHub Actions: статус CI следует проверять в pull request.
 
 ## Конфиденциальность
 
@@ -167,7 +172,9 @@ Telegram используется только на чтение: приложе
 ## Известные ограничения
 
 - подпись и нотарификация не выполняются без Apple Developer certificate;
-- анализ изображений/PDF/аудио управляется настройками, но автоматические multimodal workers в этой версии оставлены выключенными;
+- media provider для изображений/PDF/аудио ещё не реализован; соответствующий UI явно отключён, а случайно созданный media job завершается permanent failure вместо ложного success;
+- создание, переименование, объединение и архивирование тем, а также карточный вид пока явно отключены в UI;
+- тема интерфейса применяется после перезапуска; unsigned DMG не проходит Gatekeeper как notarized release;
 - Telegram иногда меняет дополнительные сценарии входа (например, email‑подтверждение); в таком случае мастер показывает безопасную ошибку и позволяет повторить вход;
 - приватные источники не получают выдуманные публичные ссылки.
 

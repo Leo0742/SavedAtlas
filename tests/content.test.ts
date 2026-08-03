@@ -6,7 +6,7 @@ describe('local content preparation',()=>{
   it('normalizes content without changing meaning',()=>expect(normalizeContent('  Привет   мир\r\n\r\n\r\n',' подпись ')).toBe('Привет мир\n\nподпись'))
   it('extracts and deduplicates URLs',()=>expect(extractUrls('https://a.test/x. и https://a.test/x')).toEqual(['https://a.test/x']))
   it('creates stable content hashes',()=>expect(contentHash('текст')).toBe(contentHash('текст')))
-  it('masks likely secrets only in outbound text',()=>{const original='token: secretvalue sk-exampleSecret123';const redacted=redactSecrets(original);expect(redacted).not.toContain('exampleSecret123');expect(original).toContain('exampleSecret123')})
+  it('masks likely secrets only in outbound text',()=>{const original='token: credential-exampleSecret123';const redacted=redactSecrets(original);expect(redacted).not.toContain('exampleSecret123');expect(original).toContain('exampleSecret123')})
   it('normalizes duplicate AI topic names',()=>expect(normalizeTopicName('Курсы по искусственному интеллекту')).toBe('курсы по ии'))
   it('detects time-dependent content and leaves personal notes evergreen',()=>{expect(shouldCheckFreshness('Новый курс, регистрация до мая https://example.com')).toBe(true);expect(shouldCheckFreshness('Личное: идея для рассказа')).toBe(false)})
   it('repairs fenced/trailing-comma JSON once',()=>expect(safeJsonRepair('```json\n{"ok":true,}\n```')).toEqual({ok:true}))
