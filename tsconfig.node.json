@@ -4,5 +4,5 @@
     "strict": true, "skipLibCheck": true, "noEmit": true, "esModuleInterop": true,
     "types": ["node", "electron-vite/node"], "allowSyntheticDefaultImports": true
   },
-  "include": ["electron.vite.config.ts", "vite.preview.config.ts", "src/main/**/*.ts", "src/preload/**/*.ts", "src/shared/**/*.ts", "tests/**/*.ts"]
+  "include": ["electron.vite.config.ts", "vite.preview.config.ts", "playwright.config.ts", "e2e/**/*.ts", "src/main/**/*.ts", "src/preload/**/*.ts", "src/shared/**/*.ts", "tests/**/*.ts"]
 }

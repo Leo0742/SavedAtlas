@@ -16,10 +16,35 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.12
           cache: npm
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  packaged-macos:
+    runs-on: macos-14
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.12
+          cache: npm
+      - run: npm ci
+      - run: npm run package:mac
+      - run: npm run test:e2e:packaged
+      - name: Publish DMG checksum
+        run: shasum -a 256 release/SavedAtlas-1.0.0-arm64.dmg | tee release/SavedAtlas-1.0.0-arm64.dmg.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SavedAtlas-unsigned-arm64
+          path: |
+            release/SavedAtlas-1.0.0-arm64.dmg
+            release/SavedAtlas-1.0.0-arm64.dmg.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SavedAtlas-responsive-screenshots
+          path: test-results/responsive/*.png
