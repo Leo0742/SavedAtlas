@@ -23,21 +23,26 @@ export const messageSchema = z.object({
   tags: z.array(z.string()), freshnessStatus: freshnessStatusSchema, freshnessVerdict: z.string(),
   freshnessReason: z.string(), freshnessConfidence: z.number(), citations: z.array(citationSchema),
   alternatives: z.array(alternativeSchema), analysisState: z.string(), userNote: z.string(), isManual: z.boolean()
+  , hiddenAt: z.string().nullable()
 })
 export type SavedMessage = z.infer<typeof messageSchema>
 
-export const topicSchema = z.object({ id: z.number(), categoryId: z.number(), categoryName: z.string(), name: z.string(), description: z.string(), icon: z.string(), messageCount: z.number(), newCount: z.number(), outdatedCount: z.number() })
+export const topicSchema = z.object({ id: z.number(), categoryId: z.number(), categoryName: z.string(), name: z.string(), description: z.string(), icon: z.string(), messageCount: z.number(), newCount: z.number(), outdatedCount: z.number(), archived: z.boolean().default(false) })
 export type Topic = z.infer<typeof topicSchema>
+export const categorySchema = z.object({ id: z.number(), name: z.string(), description: z.string(), archived: z.boolean().default(false) })
+export type Category = z.infer<typeof categorySchema>
+export const topicProposalSchema = z.object({ id: z.number(), messageId: z.number(), proposedName: z.string(), proposedDescription: z.string(), categoryId: z.number().nullable(), confidence: z.number(), status: z.enum(['pending', 'accepted', 'rejected']), createdAt: z.string() })
+export type TopicProposal = z.infer<typeof topicProposalSchema>
 
 export const dashboardSchema = z.object({
   total: z.number(), topics: z.number(), newCount: z.number(), current: z.number(), unprocessed: z.number(),
   outdated: z.number(), unchecked: z.number(), review: z.number(), lastSyncAt: z.string().nullable(),
   telegramConfigured: z.boolean(), telegramAuthorized: z.boolean(), routerConfigured: z.boolean(),
-  routerTested: z.boolean(), demoMode: z.boolean()
+  routerTested: z.boolean(), demoMode: z.boolean(), initialFullSyncComplete: z.boolean(), prototypeBackupAvailable: z.boolean(), prototypeBackupNotice: z.boolean()
 })
 export type Dashboard = z.infer<typeof dashboardSchema>
 
-export const setupStateSchema = z.object({ complete: z.boolean(), telegramAuthorized: z.boolean(), routerConfigured: z.boolean() })
+export const setupStateSchema = z.object({ complete: z.boolean(), configurationComplete: z.boolean(), telegramAuthorized: z.boolean(), routerConfigured: z.boolean(), initialFullSyncComplete: z.boolean(), demoMode: z.boolean() })
 export type SetupState = z.infer<typeof setupStateSchema>
 export const appStateSchema = z.object({ dashboard: dashboardSchema, setup: setupStateSchema, messages: z.array(messageSchema), topics: z.array(topicSchema) })
 export type AppState = z.infer<typeof appStateSchema>
@@ -46,7 +51,7 @@ export const querySchema = z.object({
   query: z.string().max(300).default(''), status: freshnessStatusSchema.optional(),
   topicId: z.number().int().positive().optional(), withoutTopic: z.boolean().optional(),
   analysisState: z.enum(['pending', 'running', 'review', 'complete', 'failed']).optional(),
-  source: z.string().max(200).optional(), mediaType: z.string().max(80).optional(),
+  source: z.string().max(200).optional(), mediaType: z.string().max(80).optional(), dateFrom: z.string().datetime().optional(), dateTo: z.string().datetime().optional(), includeHidden: z.boolean().optional(), hiddenOnly: z.boolean().optional(),
   limit: z.number().int().min(1).max(200).default(50), offset: z.number().int().min(0).default(0)
 })
 export type SearchQuery = z.input<typeof querySchema>
@@ -63,6 +68,14 @@ export const authStateSchema = z.object({ state: z.enum(['idle', 'requesting_cod
 export type AuthState = z.infer<typeof authStateSchema>
 
 export const topicChangeSchema = z.object({ messageId: z.number().int().positive(), topicId: z.number().int().positive() })
+export const topicCreateSchema = z.object({ categoryId: z.number().int().positive(), name: z.string().trim().min(1).max(120), description: z.string().max(1000).default('') })
+export const categoryCreateSchema = z.object({ name: z.string().trim().min(1).max(120), description: z.string().max(1000).default('') })
+export const topicUpdateSchema = topicCreateSchema.extend({ topicId: z.number().int().positive() })
+export const topicMergeSchema = z.object({ sourceTopicId: z.number().int().positive(), targetTopicId: z.number().int().positive() }).refine((value) => value.sourceTopicId !== value.targetTopicId)
+export const topicArchiveSchema = z.object({ topicId: z.number().int().positive(), archived: z.boolean() })
+export const tagsChangeSchema = z.object({ messageId: z.number().int().positive(), tags: z.array(z.string().trim().min(1).max(60)).max(20) })
+export const bulkTopicSchema = z.object({ messageIds: z.array(z.number().int().positive()).min(1).max(1000), topicId: z.number().int().positive().nullable() })
+export const proposalResolveSchema = z.object({ proposalId: z.number().int().positive(), action: z.enum(['accept', 'reject', 'existing']), name: z.string().trim().min(1).max(120).optional(), topicId: z.number().int().positive().optional() })
 export const noteSchema = z.object({ messageId: z.number().int().positive(), note: z.string().max(10000) })
 export const messageIdSchema = z.object({ messageId: z.number().int().positive() })
 
@@ -108,14 +121,16 @@ export type SavedAtlasAPI = {
   syncFull(): Promise<z.infer<typeof syncResultSchema>>; syncIncremental(): Promise<z.infer<typeof syncResultSchema>>;
   syncPause(): Promise<void>; syncResume(): Promise<void>; syncCancel(): Promise<void>; getSyncProgress(): Promise<SyncProgress>;
   jobsPause(): Promise<void>; jobsResume(): Promise<void>; jobsCancel(): Promise<void>; getJobProgress(): Promise<JobProgress>;
-  changeTopic(input: z.input<typeof topicChangeSchema>): Promise<void>; saveNote(input: z.input<typeof noteSchema>): Promise<void>;
-  recheckFreshness(input: z.input<typeof messageIdSchema>): Promise<void>; hideMessage(input: z.input<typeof messageIdSchema>): Promise<void>;
-  seedDemo(): Promise<void>; saveCredentials(input: z.input<typeof credentialsSchema>): Promise<void>;
+  changeTopic(input: z.input<typeof topicChangeSchema>): Promise<void>; removeTopic(input: z.input<typeof messageIdSchema>): Promise<void>; changeTags(input: z.input<typeof tagsChangeSchema>): Promise<void>; bulkMove(input: z.input<typeof bulkTopicSchema>): Promise<void>; saveNote(input: z.input<typeof noteSchema>): Promise<void>;
+  recheckFreshness(input: z.input<typeof messageIdSchema>): Promise<void>; hideMessage(input: z.input<typeof messageIdSchema>): Promise<void>; restoreMessage(input: z.input<typeof messageIdSchema>): Promise<void>;
+  createCategory(input: z.input<typeof categoryCreateSchema>): Promise<number>; createTopic(input: z.input<typeof topicCreateSchema>): Promise<number>; updateTopic(input: z.input<typeof topicUpdateSchema>): Promise<void>; mergeTopics(input: z.input<typeof topicMergeSchema>): Promise<void>; archiveTopic(input: z.input<typeof topicArchiveSchema>): Promise<void>; getTopicProposals(): Promise<TopicProposal[]>; resolveTopicProposal(input: z.input<typeof proposalResolveSchema>): Promise<void>;
+  enterDemo(): Promise<void>; resetDemo(): Promise<void>; exitDemo(): Promise<void>; saveCredentials(input: z.input<typeof credentialsSchema>): Promise<void>;
   credentialsStatus(): Promise<{ telegram: boolean; router: boolean }>;
   saveTelegramCredentials(input: z.input<typeof telegramCredentialsSchema>): Promise<void>; saveRouterSettings(input: z.input<typeof routerSettingsSchema>): Promise<void>;
   telegramSendCode(input: z.input<typeof phoneSchema>): Promise<AuthState>; telegramSubmitCode(input: z.input<typeof loginCodeSchema>): Promise<AuthState>;
   telegramSubmitPassword(input: z.input<typeof passwordSchema>): Promise<AuthState>; telegramCancelAuth(): Promise<void>;
   testRouter(): Promise<{ ok: boolean; message: string }>; getSettings(): Promise<Settings>; saveSettings(input: Settings): Promise<Settings>;
-  exportJson(): Promise<string | null>; openExternal(url: string): Promise<void>; resetData(): Promise<void>;
+  exportJson(): Promise<string | null>; exportTopicMarkdown(topicId: number): Promise<string | null>; openExternal(url: string): Promise<void>; resetData(): Promise<void>;
+  revealDatabase(): Promise<void>; revealPrototypeBackup(): Promise<void>; acknowledgePrototypeBackup(): Promise<void>; deletePrototypeBackup(): Promise<void>; quit(): Promise<void>;
   deleteSecrets(kind: 'telegram' | 'router' | 'all'): Promise<void>
 }

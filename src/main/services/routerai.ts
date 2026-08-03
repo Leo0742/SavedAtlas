@@ -44,7 +44,8 @@ export class RouterAIService {
   private client: OpenAI | null = null
   private classificationModel = 'openai/gpt-4o-mini'
   private freshnessModel = 'openai/gpt-4o-mini'
-  configure(key: string, classificationModel: string, freshnessModel: string): void { this.client = new OpenAI({ apiKey: key, baseURL: 'https://routerai.ru/api/v1' }); this.classificationModel = classificationModel; this.freshnessModel = freshnessModel }
+  configure(key: string, classificationModel: string, freshnessModel: string): void { this.client = new OpenAI({ apiKey: key, baseURL: 'https://routerai.ru/api/v1', timeout: 30_000, maxRetries: 0 }); this.classificationModel = classificationModel; this.freshnessModel = freshnessModel }
+  clear(): void { this.client = null }
   async test(): Promise<{ ok: boolean; message: string }> {
     if (!this.client) return { ok: false, message: 'Сначала сохраните ключ RouterAI.' }
     try { await this.client.models.list(); return { ok: true, message: 'Подключение к RouterAI работает.' } }
@@ -63,7 +64,7 @@ export class RouterAIService {
     return this.structuredRequest('freshness', this.freshnessModel, freshnessResponseSchema, freshnessJsonSchema, system, JSON.stringify({ material: redactSecrets(input.content), search_query: input.query }), record, [{ id: 'web', max_results: input.maxResults ?? 5, search_prompt: 'Предпочитай официальные сайты, документацию, репозитории и release notes.' }])
   }
 
-  private async structuredRequest<T>(operation: string, model: string, schema: ZodType<T>, jsonSchema: unknown, system: string, user: string, record: AttemptRecorder, plugins?: unknown[]): Promise<{ value: T; annotations: RouterAnnotation[] }> {
+  private async structuredRequest<T>(operation: string, model: string, schema: ZodType<T>, jsonSchema: unknown, system: string, user: string, record: AttemptRecorder, plugins?: unknown[]): Promise<{ value: T; annotations: RouterAnnotation[]; usage?: { inputTokens: number; outputTokens: number; cost: number } }> {
     if (!this.client) throw new Error('RouterAI не настроен')
     let lastRaw = ''; let validation = ''
     for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -73,14 +74,18 @@ export class RouterAIService {
         if (plugins) body.plugins = plugins
         const completion = await this.client.chat.completions.create(body)
         const message = completion.choices[0]?.message as unknown
+        const rawUsage = completion.usage as unknown as { prompt_tokens?: number; completion_tokens?: number; cost?: number } | undefined
+        const usage = rawUsage ? { inputTokens: rawUsage.prompt_tokens ?? 0, outputTokens: rawUsage.completion_tokens ?? 0, cost: rawUsage.cost ?? 0 } : undefined
         lastRaw = (message as { content?: string })?.content ?? '{}'
-        try { const value = schema.parse(JSON.parse(lastRaw)); record(operation, attempt, 'valid'); return { value, annotations: parseRouterAnnotations(message) } }
+        try { const value = schema.parse(JSON.parse(lastRaw)); record(operation, attempt, 'valid'); return { value, annotations: parseRouterAnnotations(message), usage } }
         catch {
-          try { const value = schema.parse(safeJsonRepair(lastRaw)); record(operation, attempt, 'locally_repaired'); return { value, annotations: parseRouterAnnotations(message) } }
+          try { const value = schema.parse(safeJsonRepair(lastRaw)); record(operation, attempt, 'locally_repaired'); return { value, annotations: parseRouterAnnotations(message), usage } }
           catch (error) { validation = error instanceof ZodError ? error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ') : 'invalid JSON'; record(operation, attempt, 'invalid', 'SCHEMA_VALIDATION') }
         }
       } catch (error) {
-        const temporary = /429|5\d\d|timeout|network|rate/i.test(error instanceof Error ? error.message : '')
+        const detail = error instanceof Error ? error.message : ''
+        if (/json.?schema|response.?format|structured.?output/i.test(detail)) throw new Error('MODEL_CAPABILITY_UNSUPPORTED: выбранная модель не поддерживает строгий JSON Schema')
+        const temporary = /429|5\d\d|timeout|network|rate/i.test(detail)
         record(operation, attempt, 'request_failed', temporary ? 'TEMPORARY' : 'REQUEST_ERROR')
         if (!temporary || attempt === 3) throw error
       }

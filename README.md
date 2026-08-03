@@ -9,7 +9,7 @@ SavedAtlas — локальный macOS‑органайзер для Telegram �
 ## Требования
 
 - macOS 13+ на Apple Silicon;
-- Node.js 20+ и npm;
+- Node.js 22.12+ и npm;
 - для реального подключения: `api_id`/`api_hash` с [my.telegram.org](https://my.telegram.org) и обычный ключ RouterAI;
 - Xcode Command Line Tools нужны для native rebuild `better-sqlite3` при создании DMG. Сертификат Apple Developer нужен только для подписи и нотарификации.
 
@@ -35,6 +35,8 @@ npm run dev
 7. Нажмите **«Завершить и синхронизировать»**. Главное окно откроется после локального импорта; очередь анализа продолжит работу в фоне.
 
 Credentials не читаются из `.env`: они вводятся только в приложении и сразу шифруются через macOS-backed Electron `safeStorage`. После настройки удалить их можно отдельно в **Настройки → Telegram** и **Настройки → RouterAI**.
+
+Если найдена база прототипа с неподдерживаемой схемой, приложение не изменяет её: SQLite, WAL и SHM переносятся в `savedatlas-prototype-backup-<timestamp>.sqlite`, после чего создаётся чистая production-схема. Архив можно показать в Finder или явно удалить в **Настройки → Данные**. Demo Mode использует отдельный `savedatlas-demo.sqlite` и не меняет реальную базу, checkpoint, очередь или credentials.
 
 ## Команды
 
@@ -163,7 +165,7 @@ resources/          original SavedAtlas icon
 - глобальный FTS за пределами первых 50 и reindex после classification/note/topic;
 - React first-run workflow и packaged Electron first-run/search workflow.
 
-Локальная проверка corrective pass: **36 Vitest tests + 1 packaged Playwright E2E**, lint, typecheck, production build и unsigned arm64 packaging. Это не утверждение о GitHub Actions: статус CI следует проверять в pull request.
+Локальная проверка corrective pass: **41 Vitest tests + 2 packaged Playwright E2E**, lint, typecheck, production build и unsigned arm64 packaging. Это не утверждение о GitHub Actions: статус CI следует проверять в pull request.
 
 ## Конфиденциальность
 
@@ -172,8 +174,8 @@ Telegram используется только на чтение: приложе
 ## Известные ограничения
 
 - подпись и нотарификация не выполняются без Apple Developer certificate;
-- media provider для изображений/PDF/аудио ещё не реализован; соответствующий UI явно отключён, а случайно созданный media job завершается permanent failure вместо ложного success;
-- создание, переименование, объединение и архивирование тем, а также карточный вид пока явно отключены в UI;
+- AI-анализ изображений/PDF/аудио не реализован: сохраняются Telegram-метаданные, анализируются только текст и подпись, media jobs не создаются;
+- второй карточный вид намеренно отсутствует;
 - тема интерфейса применяется после перезапуска; unsigned DMG не проходит Gatekeeper как notarized release;
 - Telegram иногда меняет дополнительные сценарии входа (например, email‑подтверждение); в таком случае мастер показывает безопасную ошибку и позволяет повторить вход;
 - приватные источники не получают выдуманные публичные ссылки.

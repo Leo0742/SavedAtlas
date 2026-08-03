@@ -5,6 +5,9 @@
   "main": "out/main/index.js",
   "author": "SavedAtlas",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "type": "module",
   "scripts": {
     "dev": "electron-vite dev",
@@ -14,12 +17,12 @@
     "test:e2e:packaged": "playwright test --config=playwright.config.ts",
     "test:watch": "vitest",
     "build": "electron-vite build",
-    "package:mac": "npm run build && CPLUS_INCLUDE_PATH=\"$(xcrun --show-sdk-path)/usr/include/c++/v1\" electron-builder --mac dmg --arm64",
+    "package:mac": "npm run build && CPLUS_INCLUDE_PATH=\"$(xcrun --show-sdk-path)/usr/include/c++/v1\" electron-rebuild -f -v 39.8.5 -a arm64 && electron-builder --mac dmg --arm64 --config.npmRebuild=false",
     "preview": "vite --config vite.preview.config.ts --host 127.0.0.1"
   },
   "dependencies": {
     "@electron-toolkit/utils": "^4.0.0",
-    "better-sqlite3": "^11.10.0",
+    "better-sqlite3": "^12.6.2",
     "electron-log": "^5.4.1",
     "lucide-react": "^0.468.0",
     "openai": "^4.104.0",
@@ -29,8 +32,9 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@electron/rebuild": "4.2.0",
     "@eslint/js": "^9.28.0",
-    "@playwright/test": "^1.54.1",
+    "@playwright/test": "^1.55.1",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.0",
     "@types/better-sqlite3": "^7.6.13",
@@ -38,7 +42,7 @@
     "@types/react": "^18.3.23",
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^4.5.2",
-    "electron": "^36.4.0",
+    "electron": "39.8.5",
     "electron-builder": "^26.0.12",
     "electron-vite": "^3.1.0",
     "eslint": "^9.28.0",

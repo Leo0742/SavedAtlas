@@ -72,6 +72,14 @@ export class TelegramService {
     this.generation += 1; const error = new Error('AUTH_CANCELLED'); this.codeResolver?.reject(error); this.passwordResolver?.reject(error)
     this.codeResolver = null; this.passwordResolver = null; this.authPromise = null; this.state = { state: 'cancelled' }
   }
+  async destroy(): Promise<void> {
+    this.cancel()
+    const client = this.client
+    this.client = null
+    this.phone = ''
+    if (client) { try { await client.disconnect() } catch { /* already disconnected */ } }
+    this.state = { state: 'idle' }
+  }
   session(): string { return this.client ? String((this.client.session as StringSession).save()) : '' }
 
   async fetchSavedPage(offsetId: number, limit = 100): Promise<EnrichedTelegramMessage[]> {

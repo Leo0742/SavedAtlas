@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
-import { mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import {
   appStateSchema, settingsSchema, type AppState, type JobProgress, type SavedMessage,
   type SearchQuery, type SearchResult, type Settings, type SetupState
@@ -18,7 +18,7 @@ export type ImportedMessage = {
   rawJson: string
 }
 
-export type JobType = 'classification' | 'freshness' | 'media' | 'fts'
+export type JobType = 'classification' | 'freshness' | 'fts'
 export type AnalysisJob = {
   id: number; messageId: number; jobType: JobType; attempts: number; maxAttempts: number;
   contentHash: string; promptVersion: string; dependencyId: number | null
@@ -26,15 +26,58 @@ export type AnalysisJob = {
 
 const defaultSettings: Settings = settingsSchema.parse({})
 const nowIso = (): string => new Date().toISOString()
+export const SCHEMA_VERSION = 3
 
 export class SavedAtlasDatabase {
-  private readonly db: Database.Database
+  private db!: Database.Database
+  private readonly realPath: string
+  private readonly demoPath: string
+  private activePath: string
+  private demoMode = false
+  private prototypeBackupPath: string | null = null
+
   constructor(path: string) {
+    this.realPath = path
+    this.demoPath = join(dirname(path), 'savedatlas-demo.sqlite')
+    this.activePath = path
     mkdirSync(dirname(path), { recursive: true })
-    this.db = new Database(path)
+    this.prototypeBackupPath = this.findPrototypeBackup(path)
+    this.archiveUnsupportedDatabase(path)
+    this.db = this.openDatabase(path)
+  }
+
+  private openDatabase(path: string): Database.Database {
+    const database = new Database(path)
+    this.db = database
     this.db.pragma('journal_mode = WAL')
     this.db.pragma('foreign_keys = ON')
     this.migrate()
+    return database
+  }
+
+  private archiveUnsupportedDatabase(path: string): void {
+    if (!existsSync(path)) return
+    let version = 0
+    try {
+      const probe = new Database(path, { readonly: true, fileMustExist: true })
+      try {
+        const hasTable = probe.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'").get()
+        if (hasTable) version = Number((probe.prepare('SELECT MAX(version) value FROM schema_migrations').get() as { value?: number } | undefined)?.value ?? 0)
+      } finally { probe.close() }
+    } catch { version = 0 }
+    if (version === SCHEMA_VERSION) return
+    const timestamp = Date.now()
+    const backup = join(dirname(path), `savedatlas-prototype-backup-${timestamp}.sqlite`)
+    renameSync(path, backup)
+    for (const suffix of ['-wal', '-shm']) if (existsSync(`${path}${suffix}`)) renameSync(`${path}${suffix}`, `${backup}${suffix}`)
+    this.prototypeBackupPath = backup
+  }
+
+  private findPrototypeBackup(path: string): string | null {
+    const matches = readdirSync(dirname(path), { withFileTypes: true })
+      .filter((entry) => entry.isFile() && /^savedatlas-prototype-backup-\d+\.sqlite$/.test(entry.name))
+      .map((entry) => join(dirname(path), entry.name)).sort().reverse()
+    return matches[0] ?? null
   }
 
   private migrate(): void {
@@ -74,25 +117,15 @@ export class SavedAtlasDatabase {
       CREATE INDEX IF NOT EXISTS idx_freshness_status ON freshness_analysis(status); CREATE INDEX IF NOT EXISTS idx_jobs_ready ON analysis_jobs(status, available_at, created_at);
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text, caption, source, summary, topic, category, tags, notes);
       INSERT OR IGNORE INTO sync_state(id) VALUES(1);
-      INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, datetime('now'));
+      CREATE TABLE IF NOT EXISTS topic_proposals (id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, proposed_name TEXT NOT NULL, proposed_description TEXT NOT NULL DEFAULT '', category_id INTEGER REFERENCES categories(id), confidence REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, resolved_at TEXT);
+      INSERT OR REPLACE INTO schema_migrations(version, applied_at) VALUES(3, datetime('now'));
     `)
-    this.ensureColumn('messages', 'original_post_date', 'TEXT')
-    this.ensureColumn('messages', 'forwarding_metadata_json', "TEXT NOT NULL DEFAULT '{}'")
-    this.ensureColumn('messages', 'hidden_at', 'TEXT')
-    this.ensureColumn('freshness_analysis', 'content_hash', "TEXT NOT NULL DEFAULT ''")
-    this.ensureColumn('sync_state', 'sync_mode', 'TEXT')
-    const ftsSql = (this.db.prepare("SELECT sql FROM sqlite_master WHERE name='messages_fts'").get() as { sql: string } | undefined)?.sql ?? ''
-    if (/content\s*=\s*''/i.test(ftsSql)) this.db.exec('DROP TABLE messages_fts; CREATE VIRTUAL TABLE messages_fts USING fts5(text, caption, source, summary, topic, category, tags, notes);')
     this.recoverJobs()
     for (const [key, value] of Object.entries(defaultSettings)) this.setSettingDefault(key, value)
-    this.setSettingDefault('setup_complete', false)
+    this.setSettingDefault('configuration_complete', false)
     this.setSettingDefault('telegram_authorized', false)
     this.setSettingDefault('router_tested', false)
-  }
-
-  private ensureColumn(table: string, column: string, definition: string): void {
-    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
-    if (!columns.some((entry) => entry.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+    this.setSettingDefault('prototype_notice_seen', false)
   }
 
   private setSettingDefault(key: string, value: unknown): void {
@@ -117,15 +150,18 @@ export class SavedAtlasDatabase {
   }
   setAnalysisModels(classificationModel: string, freshnessModel: string): void { this.putSetting('classification_model', classificationModel); this.putSetting('freshness_model', freshnessModel) }
   getSetupState(): SetupState {
-    const telegramAuthorized = this.setting('telegram_authorized', false); const routerConfigured = this.setting('router_configured', false); const demo = this.setting('demo_mode', false)
-    return { complete: demo || (this.setting('setup_complete', false) && telegramAuthorized && routerConfigured), telegramAuthorized, routerConfigured }
+    const telegramAuthorized = this.setting('telegram_authorized', false); const routerConfigured = this.setting('router_configured', false)
+    const configurationComplete = this.setting('configuration_complete', false)
+    const initialFullSyncComplete = Boolean((this.db.prepare('SELECT full_sync_complete value FROM sync_state WHERE id=1').get() as { value: number }).value)
+    return { complete: this.demoMode || (configurationComplete && telegramAuthorized && routerConfigured && initialFullSyncComplete), configurationComplete, telegramAuthorized, routerConfigured, initialFullSyncComplete, demoMode: this.demoMode }
   }
-  completeSetup(): void { this.putSetting('setup_complete', true) }
+  completeSetup(): void { this.putSetting('configuration_complete', true) }
   setConnectionState(patch: { telegramConfigured?: boolean; telegramAuthorized?: boolean; routerConfigured?: boolean; routerTested?: boolean }): void {
     for (const [key, value] of Object.entries(patch)) if (value !== undefined) this.putSetting(key.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`), value)
   }
 
   seedDemo(): void {
+    if (!this.demoMode) this.enterDemo()
     const now = nowIso()
     const tx = this.db.transaction(() => {
       this.clearUserData()
@@ -142,9 +178,34 @@ export class SavedAtlasDatabase {
       }
       this.db.prepare("UPDATE analysis_jobs SET status='complete',completed_at=?").run(now)
       this.db.prepare("UPDATE sync_state SET last_known_message_id=5000,last_sync_at=?,full_sync_complete=1,sync_status='idle',current_offset=0,checkpoint_json='{}' WHERE id=1").run(now)
-      this.putSetting('demo_mode', true); this.putSetting('setup_complete', true)
     })
     tx()
+  }
+
+  enterDemo(): void {
+    if (!this.demoMode) {
+      this.db.close()
+      this.activePath = this.demoPath
+      this.archiveUnsupportedDatabase(this.demoPath)
+      this.db = this.openDatabase(this.demoPath)
+      this.demoMode = true
+    }
+    const count = Number((this.db.prepare('SELECT COUNT(*) value FROM messages').get() as { value: number }).value)
+    if (!count) this.seedDemo()
+  }
+
+  resetDemo(): void {
+    if (!this.demoMode) this.enterDemo()
+    this.seedDemo()
+  }
+
+  exitDemo(): void {
+    if (!this.demoMode) return
+    this.db.close()
+    this.activePath = this.realPath
+    this.archiveUnsupportedDatabase(this.realPath)
+    this.db = this.openDatabase(this.realPath)
+    this.demoMode = false
   }
 
   getState(): AppState {
@@ -163,7 +224,8 @@ export class SavedAtlasDatabase {
       dashboard: { total: counts.total ?? 0, topics: topicCount, newCount: counts.new_count ?? 0, current: counts.current_count ?? 0,
         unprocessed: counts.unprocessed ?? 0, outdated: counts.outdated ?? 0, unchecked: counts.unchecked ?? 0, review: counts.review ?? 0,
         lastSyncAt: sync.last_sync_at, telegramConfigured: this.setting('telegram_configured', false), telegramAuthorized: setup.telegramAuthorized,
-        routerConfigured: setup.routerConfigured, routerTested: this.setting('router_tested', false), demoMode: this.setting('demo_mode', false) },
+        routerConfigured: setup.routerConfigured, routerTested: this.setting('router_tested', false), demoMode: this.demoMode,
+        initialFullSyncComplete: setup.initialFullSyncComplete, prototypeBackupAvailable: Boolean(this.prototypeBackupPath && existsSync(this.prototypeBackupPath)), prototypeBackupNotice: Boolean(this.prototypeBackupPath && existsSync(this.prototypeBackupPath) && !this.setting('prototype_notice_seen', false)) },
       setup, messages: this.searchMessages({ limit: 50, offset: 0 }).items, topics: this.getTopics()
     })
   }
@@ -176,7 +238,7 @@ export class SavedAtlasDatabase {
   search(input: SearchQuery): SavedMessage[] { return this.searchMessages(input).items }
   searchMessages(input: SearchQuery): SearchResult {
     const value = { ...input, limit: input.limit ?? 50, offset: input.offset ?? 0 }
-    const params: unknown[] = []; const clauses = ['m.hidden_at IS NULL']; let from = 'messages m'
+    const params: unknown[] = []; const clauses = value.includeHidden ? ['1=1'] : ['m.hidden_at IS NULL']; let from = 'messages m'
     const fts = value.query?.trim() ? this.ftsQuery(value.query) : null
     if (fts) { from += ' JOIN messages_fts x ON x.rowid=m.id'; clauses.push('messages_fts MATCH ?'); params.push(fts) }
     if (value.status) { clauses.push("COALESCE(f.status,'unchecked')=?"); params.push(value.status) }
@@ -185,6 +247,9 @@ export class SavedAtlasDatabase {
     if (value.analysisState) { clauses.push('m.analysis_state=?'); params.push(value.analysisState) }
     if (value.source) { clauses.push('m.source_title=?'); params.push(value.source) }
     if (value.mediaType) { clauses.push('m.media_type=?'); params.push(value.mediaType) }
+    if (value.dateFrom) { clauses.push('m.date>=?'); params.push(value.dateFrom) }
+    if (value.dateTo) { clauses.push('m.date<=?'); params.push(value.dateTo) }
+    if (value.hiddenOnly) clauses.push('m.hidden_at IS NOT NULL')
     const joins = `${from} LEFT JOIN message_analysis a ON a.message_id=m.id LEFT JOIN freshness_analysis f ON f.message_id=m.id LEFT JOIN message_topics mt ON mt.message_id=m.id AND mt.is_primary=1 LEFT JOIN topics t ON t.id=mt.topic_id LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN user_notes n ON n.message_id=m.id`
     const where = `WHERE ${clauses.join(' AND ')}`
     const total = (this.db.prepare(`SELECT COUNT(DISTINCT m.id) value FROM ${joins} ${where}`).get(...params) as { value: number }).value
@@ -209,15 +274,15 @@ export class SavedAtlasDatabase {
       freshnessStatus: (r.freshness_status ?? 'unchecked') as SavedMessage['freshnessStatus'], freshnessVerdict: String(r.verdict ?? ''),
       freshnessReason: String(r.freshness_reason ?? ''), freshnessConfidence: Number(r.freshness_confidence ?? 0),
       citations: citations as SavedMessage['citations'], alternatives: alternatives as SavedMessage['alternatives'],
-      analysisState: String(r.analysis_state), userNote: String(r.user_note ?? ''), isManual: Boolean(r.user_overridden)
+      analysisState: String(r.analysis_state), userNote: String(r.user_note ?? ''), isManual: Boolean(r.user_overridden), hiddenAt: r.hidden_at ? String(r.hidden_at) : null
     }
   }
   private jsonArray(value: unknown): unknown[] { try { const parsed = JSON.parse(String(value ?? '[]')); return Array.isArray(parsed) ? parsed : [] } catch { return [] } }
   private jsonObject(value: unknown): Record<string, unknown> { try { const parsed = JSON.parse(String(value ?? '{}')); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {} } catch { return {} } }
 
   getTopics(): AppState['topics'] {
-    const rows = this.db.prepare(`SELECT t.id,t.category_id categoryId,c.name categoryName,t.name,t.description,t.icon,COUNT(mt.message_id) messageCount,SUM(CASE WHEN m.date>=datetime('now','-7 day') THEN 1 ELSE 0 END) newCount,SUM(CASE WHEN f.status='outdated' THEN 1 ELSE 0 END) outdatedCount FROM topics t JOIN categories c ON c.id=t.category_id LEFT JOIN message_topics mt ON mt.topic_id=t.id LEFT JOIN messages m ON m.id=mt.message_id AND m.hidden_at IS NULL LEFT JOIN freshness_analysis f ON f.message_id=m.id WHERE t.is_archived=0 GROUP BY t.id ORDER BY c.sort_order,t.name`).all() as Record<string, unknown>[]
-    return rows.map((row) => ({ ...row, messageCount: Number(row.messageCount ?? 0), newCount: Number(row.newCount ?? 0), outdatedCount: Number(row.outdatedCount ?? 0) })) as AppState['topics']
+    const rows = this.db.prepare(`SELECT t.id,t.category_id categoryId,c.name categoryName,t.name,t.description,t.icon,t.is_archived archived,COUNT(mt.message_id) messageCount,SUM(CASE WHEN m.date>=datetime('now','-7 day') THEN 1 ELSE 0 END) newCount,SUM(CASE WHEN f.status='outdated' THEN 1 ELSE 0 END) outdatedCount FROM topics t JOIN categories c ON c.id=t.category_id LEFT JOIN message_topics mt ON mt.topic_id=t.id LEFT JOIN messages m ON m.id=mt.message_id AND m.hidden_at IS NULL LEFT JOIN freshness_analysis f ON f.message_id=m.id GROUP BY t.id ORDER BY t.is_archived,c.sort_order,t.name`).all() as Record<string, unknown>[]
+    return rows.map((row) => ({ ...row, archived: Boolean(row.archived), messageCount: Number(row.messageCount ?? 0), newCount: Number(row.newCount ?? 0), outdatedCount: Number(row.outdatedCount ?? 0) })) as AppState['topics']
   }
 
   changeTopic(messageId: number, topicId: number): void {
@@ -229,11 +294,73 @@ export class SavedAtlasDatabase {
       this.reindexMessage(messageId)
     })()
   }
+  removeTopic(messageId: number): void {
+    const now = nowIso()
+    this.db.transaction(() => {
+      const previous = this.db.prepare('SELECT topic_id FROM message_topics WHERE message_id=? AND is_primary=1').get(messageId) as { topic_id: number } | undefined
+      this.db.prepare('DELETE FROM message_topics WHERE message_id=? AND is_primary=1').run(messageId)
+      this.db.prepare('INSERT INTO manual_overrides(message_id,field,previous_value_json,new_value_json,created_at) VALUES(?,?,?,?,?)').run(messageId, 'primary_topic', JSON.stringify(previous?.topic_id ?? null), 'null', now)
+      this.reindexMessage(messageId)
+    })()
+  }
+  changeTags(messageId: number, names: string[]): void {
+    const now = nowIso()
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM message_tags WHERE message_id=?').run(messageId)
+      for (const name of [...new Set(names.map((value) => value.trim()).filter(Boolean))]) {
+        const normalized = normalizeTopicName(name)
+        this.db.prepare('INSERT OR IGNORE INTO tags(name,normalized_name,created_at) VALUES(?,?,?)').run(name, normalized, now)
+        const tag = this.db.prepare('SELECT id FROM tags WHERE normalized_name=?').get(normalized) as { id: number }
+        this.db.prepare("INSERT INTO message_tags(message_id,tag_id,assigned_by,confidence,user_overridden) VALUES(?,?,'user',1,1)").run(messageId, tag.id)
+      }
+      this.db.prepare('INSERT INTO manual_overrides(message_id,field,previous_value_json,new_value_json,created_at) VALUES(?,?,?,?,?)').run(messageId, 'tags', 'null', JSON.stringify(names), now)
+      this.reindexMessage(messageId)
+    })()
+  }
+  bulkMove(messageIds: number[], topicId: number | null): void { this.db.transaction(() => { for (const id of messageIds) { if (topicId) this.changeTopic(id, topicId); else this.removeTopic(id) } })() }
+  createCategory(name: string, description = ''): number {
+    const now = nowIso(); return Number(this.db.prepare("INSERT INTO categories(name,normalized_name,description,icon,sort_order,is_manual,created_at,updated_at) VALUES(?,?,?,'folder',99,1,?,?)").run(name, normalizeTopicName(name), description, now, now).lastInsertRowid)
+  }
+  createTopic(categoryId: number, name: string, description = ''): number {
+    const now = nowIso(); return Number(this.db.prepare("INSERT INTO topics(category_id,name,normalized_name,description,icon,is_manual,created_at,updated_at) VALUES(?,?,?,?, 'folder',1,?,?)").run(categoryId, name, normalizeTopicName(name), description, now, now).lastInsertRowid)
+  }
+  updateTopic(topicId: number, categoryId: number, name: string, description = ''): void {
+    this.db.prepare('UPDATE topics SET category_id=?,name=?,normalized_name=?,description=?,is_manual=1,updated_at=? WHERE id=?').run(categoryId, name, normalizeTopicName(name), description, nowIso(), topicId)
+    const ids = this.db.prepare('SELECT message_id id FROM message_topics WHERE topic_id=?').all(topicId) as Array<{ id: number }>; for (const row of ids) this.reindexMessage(row.id)
+  }
+  mergeTopics(sourceTopicId: number, targetTopicId: number): void {
+    if (sourceTopicId === targetTopicId) return
+    this.db.transaction(() => {
+      const rows = this.db.prepare('SELECT message_id messageId,is_primary isPrimary,confidence,assigned_by assignedBy,user_overridden userOverridden,created_at createdAt,updated_at updatedAt FROM message_topics WHERE topic_id=?').all(sourceTopicId) as Array<Record<string, unknown>>
+      for (const row of rows) {
+        this.db.prepare('INSERT OR IGNORE INTO message_topics(message_id,topic_id,is_primary,confidence,assigned_by,user_overridden,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)').run(row.messageId, targetTopicId, row.isPrimary, row.confidence, row.assignedBy, row.userOverridden, row.createdAt, row.updatedAt)
+        if (row.isPrimary) this.db.prepare('UPDATE message_topics SET user_overridden=MAX(user_overridden,?),assigned_by=CASE WHEN ? THEN \'user\' ELSE assigned_by END WHERE message_id=? AND topic_id=?').run(row.userOverridden, row.userOverridden, row.messageId, targetTopicId)
+      }
+      this.db.prepare('DELETE FROM message_topics WHERE topic_id=?').run(sourceTopicId)
+      this.db.prepare('UPDATE topics SET is_archived=1,updated_at=? WHERE id=?').run(nowIso(), sourceTopicId)
+      for (const row of rows) this.reindexMessage(Number(row.messageId))
+    })()
+  }
+  archiveTopic(topicId: number, archived: boolean): void { this.db.prepare('UPDATE topics SET is_archived=?,updated_at=? WHERE id=?').run(archived ? 1 : 0, nowIso(), topicId) }
+  getTopicProposals(): import('../../shared/contracts').TopicProposal[] {
+    return this.db.prepare("SELECT id,message_id messageId,proposed_name proposedName,proposed_description proposedDescription,category_id categoryId,confidence,status,created_at createdAt FROM topic_proposals WHERE status='pending' ORDER BY created_at").all() as import('../../shared/contracts').TopicProposal[]
+  }
+  resolveTopicProposal(proposalId: number, action: 'accept' | 'reject' | 'existing', name?: string, topicId?: number): void {
+    const proposal = this.db.prepare('SELECT * FROM topic_proposals WHERE id=? AND status=\'pending\'').get(proposalId) as Record<string, unknown> | undefined
+    if (!proposal) throw new Error('Предложение темы не найдено')
+    if (action === 'reject') { this.db.prepare("UPDATE topic_proposals SET status='rejected',resolved_at=? WHERE id=?").run(nowIso(), proposalId); return }
+    let resolvedTopicId = topicId
+    if (action === 'accept') { let categoryId = Number(proposal.category_id ?? 0); if (!categoryId || !this.db.prepare('SELECT 1 FROM categories WHERE id=?').get(categoryId)) categoryId = this.createCategory('Разное', 'Ручные и принятые предложения'); resolvedTopicId = this.createTopic(categoryId, name ?? String(proposal.proposed_name), String(proposal.proposed_description ?? '')) }
+    if (!resolvedTopicId) throw new Error('Выберите существующую тему')
+    this.changeTopic(Number(proposal.message_id), resolvedTopicId)
+    this.db.prepare("UPDATE topic_proposals SET status='accepted',resolved_at=? WHERE id=?").run(nowIso(), proposalId)
+    this.db.prepare("UPDATE message_analysis SET needs_review=0 WHERE message_id=?").run(proposal.message_id)
+  }
   saveNote(messageId: number, note: string): void {
     this.db.prepare('INSERT INTO user_notes(message_id,note,updated_at) VALUES(?,?,?) ON CONFLICT(message_id) DO UPDATE SET note=excluded.note,updated_at=excluded.updated_at').run(messageId, note, nowIso())
     this.reindexMessage(messageId)
   }
-  hideMessage(messageId: number): void { this.db.prepare('UPDATE messages SET hidden_at=?,updated_at=? WHERE id=?').run(nowIso(), nowIso(), messageId); this.db.prepare('DELETE FROM messages_fts WHERE rowid=?').run(messageId) }
+  hideMessage(messageId: number): void { this.db.prepare('UPDATE messages SET hidden_at=?,updated_at=? WHERE id=?').run(nowIso(), nowIso(), messageId) }
 
   importMessage(message: ImportedMessage): 'added' | 'updated' | 'unchanged' {
     const normalized = normalizeContent(message.text, message.caption); const hash = contentHash(normalized || `${message.telegramMessageId}:${message.mediaType}`); const now = nowIso()
@@ -250,10 +377,9 @@ export class SavedAtlasDatabase {
         const result = this.db.prepare("INSERT INTO messages(date,edit_date,original_post_date,text,caption,normalized_content,entities_json,urls_json,media_type,media_metadata_json,grouped_id,source_peer_id,source_message_id,source_title,source_username,source_type,source_public_url,forwarding_metadata_json,content_hash,raw_json,updated_at,telegram_message_id,analysis_state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)").run(...values, message.telegramMessageId, now)
         id = Number(result.lastInsertRowid)
       }
-      const settings = this.getSettings(); const classificationId = settings.analyzeText ? this.enqueueJob(id, 'classification', hash, 'classification-v2') : null
+      const settings = this.getSettings(); if (settings.analyzeText) this.enqueueJob(id, 'classification', hash, 'classification-v2')
       if (!settings.analyzeText) this.db.prepare("UPDATE messages SET analysis_state='complete' WHERE id=?").run(id)
-      this.enqueueJob(id, 'fts', hash, 'fts-v2', classificationId)
-      if (settings.analyzeMedia && message.mediaType !== 'text') this.enqueueJob(id, 'media', hash, 'media-v1')
+      this.enqueueJob(id, 'fts', hash, 'fts-v2')
       this.reindexMessage(id)
     })
     tx(); return existing ? 'updated' : 'added'
@@ -320,6 +446,10 @@ export class SavedAtlasDatabase {
       if (!manual && topicId) { this.db.prepare('DELETE FROM message_topics WHERE message_id=? AND is_primary=1').run(messageId); this.db.prepare("INSERT INTO message_topics(message_id,topic_id,is_primary,confidence,assigned_by,user_overridden,created_at,updated_at) VALUES(?,?,1,?,'ai',0,?,?)").run(messageId, topicId, result.primary_topic.confidence, now, now) }
       this.db.prepare("DELETE FROM message_tags WHERE message_id=? AND assigned_by='ai'").run(messageId)
       for (const name of result.tags) { const normalized = normalizeTopicName(name); this.db.prepare('INSERT OR IGNORE INTO tags(name,normalized_name,created_at) VALUES(?,?,?)').run(name, normalized, now); const tag = this.db.prepare('SELECT id FROM tags WHERE normalized_name=?').get(normalized) as { id: number }; this.db.prepare("INSERT OR REPLACE INTO message_tags(message_id,tag_id,assigned_by,confidence,user_overridden) VALUES(?,?,'ai',0.8,0)").run(messageId, tag.id) }
+      if (!topicId && result.primary_topic.proposed_name) {
+        this.db.prepare("UPDATE topic_proposals SET status='rejected',resolved_at=? WHERE message_id=? AND status='pending'").run(now, messageId)
+        this.db.prepare("INSERT INTO topic_proposals(message_id,proposed_name,proposed_description,category_id,confidence,status,created_at) VALUES(?,?,?,?,?,'pending',?)").run(messageId, result.primary_topic.proposed_name, result.primary_topic.proposed_description ?? '', result.category.existing_id, result.primary_topic.confidence, now)
+      }
       this.db.prepare('UPDATE messages SET analysis_state=?,updated_at=? WHERE id=?').run(needsReview ? 'review' : 'complete', now, messageId)
       if (result.freshness_check_needed && result.suggested_search_query && settings.webSearch) freshnessJobId = this.scheduleFreshness(messageId, options.classificationJobId ?? null)
       this.reindexMessage(messageId)
@@ -346,6 +476,7 @@ export class SavedAtlasDatabase {
   }
 
   claimJob(): AnalysisJob | null {
+    this.resolveTerminalDependencies()
     const job = this.db.prepare(`SELECT j.id,j.message_id messageId,j.job_type jobType,j.attempts,j.max_attempts maxAttempts,j.content_hash contentHash,j.prompt_version promptVersion,j.dependency_id dependencyId FROM analysis_jobs j LEFT JOIN analysis_jobs d ON d.id=j.dependency_id WHERE j.status IN ('pending','retry') AND j.available_at<=? AND (j.dependency_id IS NULL OR d.status='complete') ORDER BY j.created_at,j.id LIMIT 1`).get(nowIso()) as AnalysisJob | undefined
     if (!job) return null
     const changed = this.db.prepare("UPDATE analysis_jobs SET status='running',started_at=?,attempts=attempts+1 WHERE id=? AND status IN ('pending','retry')").run(nowIso(), job.id).changes
@@ -353,15 +484,19 @@ export class SavedAtlasDatabase {
     this.db.prepare("UPDATE messages SET analysis_state='running' WHERE id=? AND analysis_state='pending'").run(job.messageId)
     return { ...job, attempts: job.attempts + 1 }
   }
-  completeJob(jobId: number): void { this.db.prepare("UPDATE analysis_jobs SET status='complete',completed_at=?,error_code=NULL,redacted_error_message=NULL WHERE id=?").run(nowIso(), jobId) }
+  completeJob(jobId: number): void { this.db.prepare("UPDATE analysis_jobs SET status='complete',completed_at=?,error_code=NULL,redacted_error_message=NULL WHERE id=? AND status='running'").run(nowIso(), jobId) }
   failJob(job: AnalysisJob, errorCode: string, redactedMessage: string, temporary: boolean): void {
     const retry = temporary && job.attempts < job.maxAttempts
     const delay = Math.min(300, 2 ** Math.max(0, job.attempts - 1))
     this.db.prepare('UPDATE analysis_jobs SET status=?,available_at=?,completed_at=?,error_code=?,redacted_error_message=? WHERE id=?').run(retry ? 'retry' : 'failed', new Date(Date.now() + delay * 1000).toISOString(), retry ? null : nowIso(), errorCode, redactedMessage.slice(0, 300), job.id)
     if (!retry) this.db.prepare("UPDATE messages SET analysis_state='review',updated_at=? WHERE id=?").run(nowIso(), job.messageId)
   }
-  recoverJobs(): number { return this.db.prepare("UPDATE analysis_jobs SET status='pending',started_at=NULL WHERE status='running'").run().changes }
-  cancelPendingJobs(): number { const now = nowIso(); return this.db.prepare("UPDATE analysis_jobs SET status='cancelled',completed_at=? WHERE status IN ('pending','retry')").run(now).changes }
+  private resolveTerminalDependencies(): void {
+    const now = nowIso()
+    this.db.prepare("UPDATE analysis_jobs SET status='cancelled',completed_at=?,error_code='DEPENDENCY_TERMINAL',redacted_error_message='Зависимая классификация не завершилась.' WHERE job_type='freshness' AND status IN ('pending','retry') AND dependency_id IN (SELECT id FROM analysis_jobs WHERE status IN ('failed','cancelled'))").run(now)
+  }
+  recoverJobs(): number { const changed = this.db.prepare("UPDATE analysis_jobs SET status='pending',started_at=NULL WHERE status='running'").run().changes; this.resolveTerminalDependencies(); return changed }
+  cancelPendingJobs(): number { const now = nowIso(); const changed = this.db.prepare("UPDATE analysis_jobs SET status='cancelled',completed_at=? WHERE status IN ('pending','retry','running')").run(now).changes; this.resolveTerminalDependencies(); return changed }
   getJobProgress(): JobProgress {
     const row = this.db.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN status IN ('pending','retry') THEN 1 ELSE 0 END) pending,SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) running,SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) completed,SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed FROM analysis_jobs`).get() as Record<string, number>
     return { state: (row.running ?? 0) > 0 ? 'running' : 'idle', pending: row.pending ?? 0, running: row.running ?? 0, completed: row.completed ?? 0, failed: row.failed ?? 0, total: row.total ?? 0 }
@@ -372,6 +507,7 @@ export class SavedAtlasDatabase {
     return row ? Math.max(0, new Date(row.available_at).getTime() - Date.now()) : null
   }
   recordRouterAttempt(messageId: number, operation: string, attempt: number, outcome: string, errorCode?: string): void { this.db.prepare('INSERT INTO router_attempts(message_id,operation,attempt,outcome,error_code,created_at) VALUES(?,?,?,?,?,?)').run(messageId, operation, attempt, outcome, errorCode ?? null, nowIso()) }
+  recordUsage(kind: string, inputTokens: number, outputTokens: number, cost: number, durationMs = 0): void { this.db.prepare('INSERT INTO usage_events(kind,input_tokens,output_tokens,cost,duration_ms,created_at) VALUES(?,?,?,?,?,?)').run(kind, inputTokens, outputTokens, cost, durationMs, nowIso()) }
 
   updateSyncCheckpoint(lastKnownMessageId: number, offset: number, status: string, mode: 'full' | 'incremental', checkpoint: Record<string, unknown> = {}): void {
     this.db.prepare('UPDATE sync_state SET last_known_message_id=MAX(last_known_message_id,?),current_offset=?,sync_status=?,sync_mode=?,checkpoint_json=? WHERE id=1').run(lastKnownMessageId, offset, status, mode, JSON.stringify({ offsetId: offset, ...checkpoint }))
@@ -384,9 +520,35 @@ export class SavedAtlasDatabase {
     this.db.prepare("UPDATE sync_state SET last_known_message_id=MAX(last_known_message_id,?),last_sync_at=?,full_sync_complete=CASE WHEN ?='full' THEN 1 ELSE full_sync_complete END,current_offset=0,sync_status='idle',sync_mode=NULL,checkpoint_json='{}' WHERE id=1").run(latestKnownId, nowIso(), mode)
   }
 
-  exportData(): unknown { return { schemaVersion: 2, exportedAt: nowIso(), categories: this.db.prepare('SELECT id,name,description,icon FROM categories').all(), topics: this.db.prepare('SELECT id,category_id,name,description,icon FROM topics').all(), messages: this.searchMessages({ limit: 200, offset: 0 }).items } }
+  exportData(): unknown {
+    const messages: SavedMessage[] = []; let offset = 0
+    while (true) { const page = this.searchMessages({ limit: 200, offset, includeHidden: true }); messages.push(...page.items); if (page.nextOffset == null) break; offset = page.nextOffset }
+    const parse = (value: string): unknown => { try { return JSON.parse(value) } catch { return value } }
+    const telegramRows = this.db.prepare('SELECT id,telegram_peer_id telegramPeerId,edit_date editDate,original_post_date originalPostDate,entities_json entitiesJson,urls_json urlsJson,grouped_id groupedId,source_peer_id sourcePeerId,source_message_id sourceMessageId,source_type sourceType,forwarding_metadata_json forwardingMetadataJson,raw_json rawJson FROM messages').all() as Array<Record<string, unknown>>
+    const telegram = new Map(telegramRows.map((row) => [Number(row.id), { telegramPeerId: row.telegramPeerId, editDate: row.editDate, originalPostDate: row.originalPostDate, entities: parse(String(row.entitiesJson)), urls: parse(String(row.urlsJson)), groupedId: row.groupedId, sourcePeerId: row.sourcePeerId, sourceMessageId: row.sourceMessageId, sourceType: row.sourceType, forwardingMetadata: parse(String(row.forwardingMetadataJson)), raw: parse(String(row.rawJson)) }]))
+    const exportedMessages = messages.map((message) => ({ ...message, telegram: telegram.get(message.id) ?? null }))
+    const manualOverrides = (this.db.prepare('SELECT id,message_id messageId,field,previous_value_json previousValue,new_value_json newValue,created_at createdAt FROM manual_overrides ORDER BY id').all() as Array<Record<string, unknown>>).map((row) => ({ ...row, previousValue: parse(String(row.previousValue)), newValue: parse(String(row.newValue)) }))
+    return { schemaVersion: SCHEMA_VERSION, exportedAt: nowIso(), profile: this.demoMode ? 'demo' : 'real', categories: this.db.prepare('SELECT id,name,description,icon,is_archived archived FROM categories').all(), topics: this.db.prepare('SELECT id,category_id categoryId,name,description,icon,is_archived archived FROM topics').all(), tags: this.db.prepare('SELECT id,name FROM tags').all(), manualOverrides, messages: exportedMessages }
+  }
+  exportTopicMarkdown(topicId: number): string {
+    const topic = this.db.prepare('SELECT name,description FROM topics WHERE id=?').get(topicId) as { name: string; description: string } | undefined
+    if (!topic) throw new Error('Тема не найдена')
+    const messages: SavedMessage[] = []; let offset = 0
+    while (true) { const page = this.searchMessages({ topicId, limit: 200, offset }); messages.push(...page.items); if (page.nextOffset == null) break; offset = page.nextOffset }
+    const body = messages.map((message) => `## ${message.summary || message.text.slice(0, 80) || 'Материал'}\n\n${message.text || message.caption}\n\n- Источник: ${message.sourceTitle}\n- Дата: ${message.date}\n- Теги: ${message.tags.join(', ') || '—'}\n${message.userNote ? `- Заметка: ${message.userNote}\n` : ''}`).join('\n')
+    return `# ${topic.name}\n\n${topic.description}\n\n${body}`
+  }
+  restoreMessage(messageId: number): void { this.db.prepare('UPDATE messages SET hidden_at=NULL,updated_at=? WHERE id=?').run(nowIso(), messageId); this.reindexMessage(messageId) }
+  getDatabasePath(): string { return this.activePath }
+  getPrototypeBackupPath(): string | null { return this.prototypeBackupPath && existsSync(this.prototypeBackupPath) ? this.prototypeBackupPath : null }
+  acknowledgePrototypeBackup(): void { this.putSetting('prototype_notice_seen', true) }
+  deletePrototypeBackup(): void {
+    const path = this.getPrototypeBackupPath(); if (!path) return
+    for (const candidate of [path, `${path}-wal`, `${path}-shm`]) if (existsSync(candidate)) unlinkSync(candidate)
+    this.prototypeBackupPath = null
+  }
   clearUserData(): void {
-    this.db.exec("DELETE FROM analysis_jobs;DELETE FROM router_attempts;DELETE FROM message_tags;DELETE FROM tags;DELETE FROM message_topics;DELETE FROM freshness_analysis;DELETE FROM message_analysis;DELETE FROM user_notes;DELETE FROM manual_overrides;DELETE FROM messages;DELETE FROM messages_fts;DELETE FROM topics;DELETE FROM categories;UPDATE sync_state SET last_known_message_id=0,last_sync_at=NULL,full_sync_complete=0,current_offset=0,sync_status='idle',sync_mode=NULL,checkpoint_json='{}';")
+    this.db.exec("DELETE FROM analysis_jobs;DELETE FROM router_attempts;DELETE FROM topic_proposals;DELETE FROM message_tags;DELETE FROM tags;DELETE FROM message_topics;DELETE FROM freshness_analysis;DELETE FROM message_analysis;DELETE FROM user_notes;DELETE FROM manual_overrides;DELETE FROM messages;DELETE FROM messages_fts;DELETE FROM topics;DELETE FROM categories;UPDATE sync_state SET last_known_message_id=0,last_sync_at=NULL,full_sync_complete=0,current_offset=0,sync_status='idle',sync_mode=NULL,checkpoint_json='{}';")
   }
   close(): void { this.db.close() }
   backup(destination: string): void { void this.db.backup(destination) }

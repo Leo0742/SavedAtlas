@@ -43,15 +43,16 @@ export class JobRunner {
       if (job.jobType === 'classification') {
         const taxonomy = this.db.getTaxonomy()
         const response = await this.router.classify({ ...message, categories: taxonomy.categories, topics: taxonomy.topics }, (operation, attempt, outcome, code) => this.db.recordRouterAttempt(job.messageId, operation, attempt, outcome, code))
+        if (response.usage) this.db.recordUsage('classification', response.usage.inputTokens, response.usage.outputTokens, response.usage.cost)
         this.db.applyClassification(job.messageId, response.value as z.infer<typeof classificationResponseSchema>, { classificationJobId: job.id })
       } else if (job.jobType === 'freshness') {
         const input = this.db.getFreshnessInput(job.messageId)
         if (input) {
           const response = await this.router.checkFreshness({ ...input, maxResults: this.db.getSettings().freshnessMaxResults }, (operation, attempt, outcome, code) => this.db.recordRouterAttempt(job.messageId, operation, attempt, outcome, code))
+          if (response.usage) this.db.recordUsage('freshness', response.usage.inputTokens, response.usage.outputTokens, response.usage.cost)
           this.db.applyFreshness(job.messageId, response.value as z.infer<typeof freshnessResponseSchema>, response.annotations)
         }
       } else if (job.jobType === 'fts') this.db.reindexMessage(job.messageId)
-      else if (job.jobType === 'media') throw new Error('MEDIA_PROVIDER_UNAVAILABLE')
       this.db.completeJob(job.id)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
